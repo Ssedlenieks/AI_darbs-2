@@ -1,8 +1,7 @@
 import os
-import os
 import requests
 from dotenv import load_dotenv
-from openai import OpenAI
+import openai
 
 
 class ChatbotService:
@@ -10,22 +9,19 @@ class ChatbotService:
         # 1. SOLIS - API atslēgas ielāde
         load_dotenv()
         # Expect user to set HUGGINGFACE_API_KEY in .env
-        self.hf_api_key = os.getenv('HUGGINGFACE_API_KEY') or os.getenv('HF_API_KEY')
+        raw_key = os.getenv('HUGGINGFACE_API_KEY') or os.getenv('HF_API_KEY')
+        # strip accidental whitespace/newlines
+        self.hf_api_key = raw_key.strip() if isinstance(raw_key, str) else raw_key
 
-        # 2. SOLIS - OpenAI klienta inicializācija izmantojot "katanemo/Arch-Router-1.5B" modeli
-        # We attempt to use the OpenAI-compatible client first (some HF setups provide OpenAI-compatible endpoints).
+        # 2. SOLIS - OpenAI-compatible client: not initialized here. We'll use OpenAI package as a fallback if
+        # OPENAI_API_KEY is set. For HF OpenAI-compatible bases, user can configure OPENAI_API_BASE and
+        # OPENAI_API_KEY in .env and the OpenAI fallback will be attempted later.
         self.client = None
-        self.openai_api_base = os.getenv('OPENAI_API_BASE')
-        try:
-            if self.openai_api_base and self.hf_api_key:
-                # Initialize OpenAI client pointing to a custom base (optional)
-                self.client = OpenAI(api_key=self.hf_api_key, api_base=self.openai_api_base)
-        except Exception:
-            # If OpenAI client initialization fails, we'll fallback to direct HF HTTP calls.
-            self.client = None
 
-        # Model to use on Hugging Face
-        self.model = "katanemo/Arch-Router-1.5B"
+        # Model to use on Hugging Face — switch to a public, small model to ensure availability
+        # Primary model (public): distilgpt2 — fallback models used if primary is unavailable
+        self.model = "distilgpt2"
+        self.fallback_models = ["gpt2"]
 
         # 3. SOLIS - Sistēmas instrukcijas definēšana
         # Keep the assistant focused on e-shop related questions and products.
@@ -89,33 +85,68 @@ class ChatbotService:
         if not self.hf_api_key:
             return {"response": "Hugging Face API key not configured."}
 
-        hf_url = f"https://api-inference.huggingface.co/models/{self.model}"
+        # Try primary model first, then fallbacks
+        models_to_try = [self.model] + self.fallback_models
         headers = {"Authorization": f"Bearer {self.hf_api_key}", "Content-Type": "application/json"}
         payload = {
             "inputs": prompt,
             "parameters": {"max_new_tokens": 200, "temperature": 0.2},
         }
 
-        try:
-            r = requests.post(hf_url, headers=headers, json=payload, timeout=30)
-            r.raise_for_status()
-            data = r.json()
-            # Data can be a list or dict depending on the HF endpoint
-            if isinstance(data, list) and len(data) > 0:
-                generated = data[0].get('generated_text') or data[0].get('generated_texts') or ''
-            elif isinstance(data, dict):
-                generated = data.get('generated_text') or data.get('generated_texts') or ''
-            else:
-                generated = ''
+        last_err = None
+        for m in models_to_try:
+            hf_url = f"https://api-inference.huggingface.co/models/{m}"
+            try:
+                r = requests.post(hf_url, headers=headers, json=payload, timeout=30)
+                r.raise_for_status()
+                data = r.json()
+                # Data can be a list or dict depending on the HF endpoint
+                if isinstance(data, list) and len(data) > 0:
+                    generated = data[0].get('generated_text') or data[0].get('generated_texts') or ''
+                elif isinstance(data, dict):
+                    # Some models return {'generated_text': '...'} or {'generated_texts': ['...']}
+                    generated = data.get('generated_text') or (data.get('generated_texts') and data.get('generated_texts')[0]) or ''
+                else:
+                    generated = ''
 
-            # Attempt to trim assistant label if present
-            if isinstance(generated, list):
-                generated = generated[0]
-            # Remove the prompt from the generated text if it was echoed
-            if isinstance(generated, str) and prompt in generated:
-                generated = generated.split(prompt, 1)[-1].strip()
+                if isinstance(generated, list):
+                    generated = generated[0]
+                if isinstance(generated, str) and prompt in generated:
+                    generated = generated.split(prompt, 1)[-1].strip()
 
-            return {"response": generated}
-        except Exception as e:
-            print(f"HF inference request failed: {e}")
-            return {"response": "An error occurred when contacting the AI service."}
+                return {"response": generated, "model_used": m}
+            except requests.HTTPError as he:
+                last_err = he
+                # If model is not available (e.g., 410 Gone), try next fallback
+                print(f"HF inference request for model {m} failed: {he}")
+                continue
+            except Exception as e:
+                last_err = e
+                print(f"HF inference request failed for model {m}: {e}")
+                continue
+
+        # If we get here, all models failed
+        print(f"All HF model requests failed, last error: {last_err}")
+        # Try OpenAI API as a fallback if configured
+        openai_key = os.getenv('OPENAI_API_KEY')
+        if openai_key:
+            try:
+                openai.api_key = openai_key
+                messages = [
+                    {"role": "system", "content": self.system_instruction},
+                ]
+                messages.extend(chat_history)
+                messages.append({"role": "user", "content": user_message})
+
+                resp = openai.ChatCompletion.create(model="gpt-3.5-turbo", messages=messages, max_tokens=200)
+                if resp and resp.choices:
+                    text = resp.choices[0].message.get('content') if hasattr(resp.choices[0], 'message') else resp.choices[0].get('message', {}).get('content')
+                    return {"response": text or "", "model_used": "openai:gpt-3.5-turbo"}
+            except Exception as e:
+                print(f"OpenAI fallback failed: {e}")
+
+        # Final simple fallback: return product list or a helpful message so chat still works offline
+        if extra_products_text:
+            return {"response": f"AI services are unavailable right now. Here are the available products:\n\n{extra_products_text}"}
+
+        return {"response": "AI services are currently unavailable. Please try again later.", "error": str(last_err)}
