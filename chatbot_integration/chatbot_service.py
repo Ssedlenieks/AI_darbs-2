@@ -6,6 +6,7 @@ from huggingface_hub import InferenceClient
 class ChatbotService:
     def __init__(self):
         """Inicializē ChatbotService ar Hugging Face API"""
+        #viss strada
 
         # 1. SOLIS - API atslēgas ielāde
         load_dotenv()  # Ielādē no .env failā ROOT direktorijā
